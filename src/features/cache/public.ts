@@ -49,7 +49,9 @@ export function isPrivatePath(pathname: string): boolean {
     pathname === '/cart' ||
     pathname === '/checkout' ||
     pathname === '/api/cart' ||
-    pathname === '/api/checkout'
+    pathname === '/api/checkout' ||
+    pathname === '/api/coupon' ||
+    pathname.startsWith('/api/coupon/')
   );
 }
 

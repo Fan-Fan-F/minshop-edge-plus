@@ -1,7 +1,10 @@
 import { handle } from '@astrojs/cloudflare/handler';
 import { env } from 'cloudflare:workers';
 import { sweepStaleNotifications } from './features/email/outbox';
-import { releaseExpiredReservations } from './features/orders/reservations';
+import {
+  releaseExpiredReservations,
+  releaseStaleHostedReservations,
+} from './features/orders/reservations';
 import { getSetting } from './features/settings/db';
 
 /**
@@ -31,6 +34,7 @@ async function runScheduledSweeps(): Promise<void> {
   // costs sales, since held stock reads as sold out to every shopper.
   try {
     await releaseExpiredReservations(db, 50);
+    await releaseStaleHostedReservations(db, 24, 50);
   } catch (err) {
     console.error('Scheduled reservation sweep failed:', err);
   }

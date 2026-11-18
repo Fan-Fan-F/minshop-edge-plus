@@ -61,6 +61,7 @@ describe('responseCacheControl', () => {
     '/api/internal/cache-purge',
     '/api/cart',
     '/api/checkout',
+    '/api/coupon/validate',
   ])('marks private route %s no-store on every response path', (path) => {
     expect(responseCacheControl(path, 200, null)).toBe(PRIVATE_CACHE_CONTROL);
     expect(responseCacheControl(path, 302, 'public, s-maxage=600')).toBe(

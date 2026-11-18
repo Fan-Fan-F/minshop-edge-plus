@@ -290,7 +290,7 @@ if (submitted) {
               // instead of ignoring shipping or guessing at the first option.
               if (rail !== 'lightning') {
                 const provider = await getPaymentProvider(rail);
-                const result = await provider.createCheckout({
+                const { url: checkoutUrl } = await provider.createCheckout({
                   lineItems: lines.map((l) => ({
                     name: l.name,
                     amountCents: l.unitPriceCents,
@@ -312,7 +312,7 @@ if (submitted) {
                     email: addr.email,
                   },
                 });
-                return Astro.redirect(result.url, 303);
+                return Astro.redirect(checkoutUrl, 303);
               }
               const minted = await mintLightningOrder(env.DB, await getLightningBackend(), {
                 origin: Astro.url.origin,

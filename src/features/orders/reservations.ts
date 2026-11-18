@@ -249,6 +249,54 @@ export async function releaseExpiredReservations(
   await purgeTransitions(db, changedProductIds, purger);
 }
 
+/**
+ * Safely reclaim stale hosted checkout reservations (stripe, opennode) whose
+ * expires_at passed long ago (default: beyond 24h grace window) without any
+ * recorded order. This prevents abandoned hosted checkouts or dropped webhooks
+ * from permanently locking inventory at the edge.
+ */
+export async function releaseStaleHostedReservations(
+  db: D1Database,
+  staleGraceHours = 24,
+  limit = 50,
+  purger?: StockTransitionPurger,
+): Promise<number> {
+  const safeHours = Math.max(1, Math.floor(staleGraceHours));
+  const { results } = await db
+    .prepare(
+      `SELECT r.public_id
+         FROM checkout_reservations r
+        WHERE r.payment_method IN ('stripe', 'opennode')
+          AND r.status IN ('active', 'payment_pending')
+          AND r.expires_at <= datetime('now', '-' || ? || ' hours')
+          AND NOT EXISTS (
+            SELECT 1 FROM orders o
+             WHERE o.public_id = r.public_id
+                OR o.provider_session_id = r.public_id
+          )
+        ORDER BY r.expires_at ASC
+        LIMIT ?`,
+    )
+    .bind(safeHours, limit)
+    .all<{ public_id: string }>();
+
+  let reclaimed = 0;
+  const changedProductIds: number[] = [];
+  for (const row of results ?? []) {
+    const res = await releaseReservation(
+      db,
+      row.public_id,
+      'expired',
+    );
+    if (res.released) {
+      reclaimed++;
+      changedProductIds.push(...res.changedProductIds);
+    }
+  }
+  await purgeTransitions(db, changedProductIds, purger);
+  return reclaimed;
+}
+
 /** Expire one locally authoritative self-rendered hold during a status read. */
 export async function expireSelfRenderedReservation(
   db: D1Database,

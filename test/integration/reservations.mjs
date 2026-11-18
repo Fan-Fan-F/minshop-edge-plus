@@ -7,11 +7,16 @@ import {
   expireSelfRenderedReservation,
   markInventoryReservationPaymentPending,
   releaseExpiredReservations,
+  releaseStaleHostedReservations,
   releaseInventoryReservation,
   reserveInventory,
 } from '../../src/features/orders/reservations.ts';
 import { reservationItems } from '../../src/features/orders/reservationItems.ts';
-import { recordPaidOrder } from '../../src/features/orders/db.ts';
+import {
+  recordPaidOrder,
+  batchResolveInventoryExceptions,
+  getInventoryExceptionSummary,
+} from '../../src/features/orders/db.ts';
 import { pendingToPaidOrder } from '../../src/features/payments/lightning/pending.ts';
 import {
   claimNotification,
@@ -716,6 +721,75 @@ try {
     true,
   );
   assert.deepEqual(purged, ['prod_purgeboundary'], 'crossing In stock → Sold out purged the product');
+
+  // (5) Stale hosted reservation reclamation
+  await db.prepare(
+    `INSERT INTO products (public_id, name, slug, description, price_cents, currency, stock, active)
+     VALUES ('prod_stalehosted', 'Stale Tee', 'stale-tee', '', 500, 'usd', 5, 1)`,
+  ).run();
+  const staleProd = await db.prepare("SELECT id FROM products WHERE slug = 'stale-tee'").first();
+
+  const staleResId = 'ord_stale_123';
+  await db.prepare(
+    `INSERT INTO checkout_reservations (public_id, items, payment_method, status, expires_at)
+     VALUES (?, ?, 'stripe', 'active', datetime('now', '-25 hours'))`,
+  ).bind(staleResId, JSON.stringify([{ productId: staleProd.id, quantity: 2, priceCents: 500, name: 'Stale Tee' }])).run();
+  await db.prepare("UPDATE products SET stock = stock - 2 WHERE id = ?").bind(staleProd.id).run();
+
+  const recentResId = 'ord_recent_456';
+  await db.prepare(
+    `INSERT INTO checkout_reservations (public_id, items, payment_method, status, expires_at)
+     VALUES (?, ?, 'stripe', 'active', datetime('now', '+1 hour'))`,
+  ).bind(recentResId, JSON.stringify([{ productId: staleProd.id, quantity: 1, priceCents: 500, name: 'Stale Tee' }])).run();
+
+  const settledResId = 'ord_settled_789';
+  await db.prepare(
+    `INSERT INTO checkout_reservations (public_id, items, payment_method, status, expires_at)
+     VALUES (?, ?, 'stripe', 'active', datetime('now', '-30 hours'))`,
+  ).bind(settledResId, JSON.stringify([{ productId: staleProd.id, quantity: 1, priceCents: 500, name: 'Stale Tee' }])).run();
+  await db.prepare(
+    `INSERT INTO orders (provider_session_id, public_id, amount_total_cents, currency, status)
+     VALUES ('session_settled_789', ?, 500, 'usd', 'paid')`,
+  ).bind(settledResId).run();
+
+  const stalePurged = [];
+  const reclaimed = await releaseStaleHostedReservations(db, 24, 50, async (p) => stalePurged.push(...p));
+  assert.equal(reclaimed, 1, 'reclaimed exactly the one un-settled stale reservation');
+
+  const staleRow = await db.prepare("SELECT status FROM checkout_reservations WHERE public_id = ?").bind(staleResId).first();
+  assert.equal(staleRow.status, 'expired', 'stale reservation was marked expired');
+
+  const recentRow = await db.prepare("SELECT status FROM checkout_reservations WHERE public_id = ?").bind(recentResId).first();
+  assert.equal(recentRow.status, 'active', 'recent reservation remains active');
+
+  const settledResRow = await db.prepare("SELECT status FROM checkout_reservations WHERE public_id = ?").bind(settledResId).first();
+  assert.equal(settledResRow.status, 'active', 'settled reservation was untouched');
+
+  const restoredStock = await db.prepare("SELECT stock FROM products WHERE id = ?").bind(staleProd.id).first();
+  assert.equal(restoredStock.stock, 5, 'stock was restored by the reclaimed reservation');
+
+  // (6) Inventory exception batching and summary
+  const iexc1 = 'iexc_batch1';
+  const iexc2 = 'iexc_batch2';
+  await db.prepare(
+    `INSERT INTO order_inventory_exceptions (public_id, order_id, product_id, variant_id, requested_qty, consumed_qty, shortfall_qty)
+     VALUES (?, 999, ?, NULL, 3, 1, 2)`,
+  ).bind(iexc1, staleProd.id).run();
+  await db.prepare(
+    `INSERT INTO order_inventory_exceptions (public_id, order_id, product_id, variant_id, requested_qty, consumed_qty, shortfall_qty)
+     VALUES (?, 999, ?, NULL, 2, 0, 2)`,
+  ).bind(iexc2, staleProd.id).run();
+
+  const summary = await getInventoryExceptionSummary(db);
+  const prodSummary = summary.find((s) => s.productId === staleProd.id);
+  assert.ok(prodSummary, 'found shortfall summary for product');
+  assert.equal(prodSummary.totalShortfall, 4, 'total shortfall summed to 4');
+
+  const resolvedCount = await batchResolveInventoryExceptions(db, [iexc1, iexc2]);
+  assert.equal(resolvedCount, 2, 'both exceptions resolved in batch');
+
+  const summaryAfter = await getInventoryExceptionSummary(db);
+  assert.ok(!summaryAfter.some((s) => s.productId === staleProd.id), 'no unresolved shortfall left');
 
   console.log('Reservation integration passed: concurrency + pending + terminal settlement + inventory exception + legacy + cross-release rollback + stock purge offset');
 } finally {

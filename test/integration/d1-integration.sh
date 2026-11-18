@@ -235,9 +235,16 @@ assert_cache_control() {
         --write-out '%{http_code}' \
         "http://127.0.0.1:$test_port$path")" && curl_rc=0 || curl_rc=$?
     fi
-    [[ "$curl_rc" == 0 ]] && break
+    local is_conn_lost=0
+    if [[ "$curl_rc" != 0 ]]; then
+      is_conn_lost=1
+    elif [[ "$status" == "500" && -f "$body" ]] && grep -q "Network connection lost" "$body" 2>/dev/null; then
+      is_conn_lost=1
+      curl_rc=500
+    fi
+    [[ "$is_conn_lost" == 0 ]] && break
     if (( attempt < 3 )); then
-      echo "  (retrying $method $path — curl exit $curl_rc, no response)" >&2
+      echo "  (retrying $method $path — transport dropped, curl/status $curl_rc)" >&2
       sleep 1
     fi
   done
@@ -280,7 +287,8 @@ for path in \
   /cart /checkout /express /payment-setup /partials/cart-count \
   /account /account/login /order/not-a-token /order/not-a-token/status \
   /order/not-a-token/download/itm_k7m2qx8vn6 /pay/not-an-id \
-  /admin /api/admin/products /api/internal/cache-purge /api/cart /api/checkout
+  /admin /api/admin/products /api/internal/cache-purge /api/cart /api/checkout \
+  /api/coupon/validate
 do
   assert_cache_control "$path" "$private_cache"
 done

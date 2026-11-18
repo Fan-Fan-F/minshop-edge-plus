@@ -41,6 +41,11 @@ import { purgeStockProductCache } from '../../features/cache/purge';
 import { lifecycleActive } from '../../features/digitalDelivery/rollout.ts';
 import { mintLightningOrder } from '../../features/payments/lightning-provider';
 import { getLightningBackend } from '../../features/payments/lightning';
+import {
+  findCouponByCode,
+  validateCoupon,
+  calculateDiscount,
+} from '../../features/discounts/engine';
 
 export const prerender = false;
 
@@ -766,6 +771,38 @@ async function handleJsonCheckout(request: Request, url: URL): Promise<Response>
     }
   }
 
+  // Optional coupon / promotion code evaluation for programmatic checkouts
+  const rawCouponCode =
+    (body as { coupon_code?: unknown; promo_code?: unknown })?.coupon_code ??
+    (body as { coupon_code?: unknown; promo_code?: unknown })?.promo_code;
+  let appliedDiscount: {
+    code: string;
+    discountCents: number;
+    subtotalDiscountCents: number;
+    shippingDiscountCents: number;
+  } | null = null;
+  if (typeof rawCouponCode === 'string' && rawCouponCode.trim()) {
+    const coupon = findCouponByCode(rawCouponCode);
+    const validation = validateCoupon(coupon, { subtotalCents });
+    if (!validation.valid || !validation.coupon) {
+      return cjson(
+        { error: `Invalid coupon code "${rawCouponCode}". Reason: ${validation.reason ?? 'invalid'}` },
+        400,
+      );
+    }
+    const disc = calculateDiscount({
+      coupon: validation.coupon,
+      subtotalCents,
+      shippingFeeCents: chosen?.amountCents ?? 0,
+    });
+    appliedDiscount = {
+      code: validation.coupon.code,
+      discountCents: disc.totalDiscountCents,
+      subtotalDiscountCents: disc.discountSubtotalCents,
+      shippingDiscountCents: disc.discountShippingCents,
+    };
+  }
+
   if (method === 'lightning' && shippingOn && shipTo && chosen && inAppQuote) {
     const { publicId: lnPublicId, accessToken: lnAccessToken } = await claimOrderIdentity(env.DB);
     const lnReserved = await reserveInventory(
@@ -943,12 +980,17 @@ async function handleJsonCheckout(request: Request, url: URL): Promise<Response>
     order_public_id: publicId,
     currency: storeCurrency.toUpperCase(),
     subtotal_cents: subtotalCents,
+    ...(appliedDiscount && {
+      discount_cents: appliedDiscount.discountCents,
+      coupon_code: appliedDiscount.code,
+      discounted_subtotal_cents: Math.max(0, subtotalCents - appliedDiscount.subtotalDiscountCents),
+    }),
     // The rate this order was priced with, when the in-app step chose one —
     // the Lightning branch has always echoed it; demo/OpenNode should too.
     ...(chosen && {
       shipping_cents: chosen.amountCents,
       shipping_label: chosen.label,
-      total_cents: subtotalCents + chosen.amountCents,
+      total_cents: Math.max(0, (subtotalCents + chosen.amountCents) - (appliedDiscount?.discountCents ?? 0)),
     }),
     items: lines.map((l) => ({
       slug: l.product.slug,

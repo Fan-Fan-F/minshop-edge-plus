@@ -148,6 +148,57 @@ export async function resolveInventoryException(
   return (result.meta.changes ?? 0) > 0;
 }
 
+export interface InventoryShortfallSummary {
+  productId: number;
+  variantId: number | null;
+  totalShortfall: number;
+  unresolvedOrdersCount: number;
+}
+
+/**
+ * Batch resolve multiple inventory exceptions in a single round-trip.
+ * Useful for automated reconciliation after restocking or supplier compensation.
+ */
+export async function batchResolveInventoryExceptions(
+  db: D1Database,
+  publicIds: string[],
+): Promise<number> {
+  if (publicIds.length === 0) return 0;
+  const placeholders = publicIds.map(() => '?').join(',');
+  const result = await db
+    .prepare(
+      `UPDATE order_inventory_exceptions
+       SET resolved_at = datetime('now')
+       WHERE public_id IN (${placeholders}) AND resolved_at IS NULL`,
+    )
+    .bind(...publicIds)
+    .run();
+  return result.meta.changes ?? 0;
+}
+
+/**
+ * Summarize unresolved inventory shortfalls across the catalog,
+ * helping merchants and automated replenishment systems see aggregate shortages.
+ */
+export async function getInventoryExceptionSummary(
+  db: D1Database,
+): Promise<InventoryShortfallSummary[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT product_id AS productId,
+              variant_id AS variantId,
+              SUM(shortfall_qty) AS totalShortfall,
+              COUNT(DISTINCT order_id) AS unresolvedOrdersCount
+         FROM order_inventory_exceptions
+        WHERE resolved_at IS NULL
+        GROUP BY product_id, variant_id
+        ORDER BY totalShortfall DESC`,
+    )
+    .all<InventoryShortfallSummary>();
+  return results ?? [];
+}
+
+
 /** A paid order to persist, in provider-agnostic terms. */
 export interface PaidOrderInput {
   providerSessionId: string;
